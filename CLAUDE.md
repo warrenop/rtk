@@ -16,7 +16,7 @@ This is a fork with critical fixes for git argument parsing and modern JavaScrip
 
 **Verify correct installation:**
 ```bash
-rtk --version  # Should show "rtk 0.28.2" (or newer)
+rtk --version  # Should show "rtk 0.40.0" (or newer — source of truth is Cargo.toml)
 rtk gain       # Should show token savings stats (NOT "command not found")
 ```
 
@@ -69,13 +69,29 @@ cargo generate-rpm            # RPM package (needs cargo-generate-rpm, after rel
 
 rtk uses a **command proxy architecture**: `main.rs` routes CLI commands via a Clap `Commands` enum to specialized filter modules in `src/cmds/*/`, each of which executes the underlying command and compresses its output. Token savings are tracked in SQLite via `src/core/tracking.rs`.
 
-For the full architecture, component details, and module development patterns, see:
-- [ARCHITECTURE.md](docs/contributing/ARCHITECTURE.md) — System design, module organization, filtering strategies, error handling
-- [docs/contributing/TECHNICAL.md](docs/contributing/TECHNICAL.md) — End-to-end flow, folder map, hook system, filter pipeline
+### Command resolution (three tiers)
 
-Module responsibilities are documented in each folder's `README.md` and each file's `//!` doc header. Browse `src/cmds/*/` to discover available filters.
+How a command reaches a filter — or safely doesn't — only makes sense by reading `main.rs::run_cli` and `run_fallback` together:
 
-Supported ecosystems: git/gh/gt, cargo, go/golangci-lint, npm/pnpm/npx, ruff/pytest/pip/mypy, rspec/rubocop/rake, dotnet, playwright/vitest/jest, docker/kubectl/aws.
+1. **Known command + known subcommand** → dedicated filter module (e.g. `rtk git log` → `cmds::git::git::run`). The optimized path.
+2. **Known command + unknown subcommand** → each command group has a `#[command(external_subcommand)] Other(Vec<OsString>)` variant that passes through to the real binary unchanged (e.g. `rtk cargo foo` → raw `cargo foo`). A filter never blocks an unsupported subcommand.
+3. **Clap fails to parse entirely** → `run_fallback()` looks up a TOML filter (`src/filters/*.toml` via `core::toml_filter`); on a match it captures and filters output, otherwise it streams the raw command through untouched (`Stdio::inherit`). Commands listed in `RTK_META_COMMANDS` (gain, init, proxy, verify, …) are exempt — a parse error there prints Clap's message instead of shelling out to `$PATH`.
+
+Net effect: **any command runs even when rtk has no filter for it.** The "fallback pattern" the coding rules mandate is enforced structurally at the routing layer, not just per-module.
+
+### Hook integration
+
+`rtk rewrite "<cmd>"` is the **single source of truth** for every agent integration. Each hook (Claude PreToolUse, Gemini BeforeTool, Copilot, Cursor, plus the OpenCode/Pi/Hermes plugins) ultimately calls it: exit 0 + a rewritten line means "use this rtk equivalent", exit 1 + no output means "no equivalent, run as-is". Hook processors live in `src/hooks/`; `rtk init` installs them and patches the agent's settings.
+
+### Supporting infrastructure
+
+- **Tee recovery** (`src/core/tee.rs`): on command failure the full raw output is saved to a log so the LLM can re-read it without re-running; filtered output prints a `[full output: …]` hint.
+- **TOML filter DSL** (`src/core/toml_filter.rs`, `src/filters/*.toml`): declarative filters. Project-local filters in `.rtk/filters/*.toml` require `rtk trust` before they load.
+- **Tracking** (`src/core/tracking.rs`): every run records input/output token counts to SQLite, surfaced by `rtk gain`.
+
+For full details see [ARCHITECTURE.md](docs/contributing/ARCHITECTURE.md) (system design, filtering strategies, error handling) and [docs/contributing/TECHNICAL.md](docs/contributing/TECHNICAL.md) (end-to-end flow, folder map, hook system, filter pipeline). Module responsibilities are documented in each folder's `README.md` and each file's `//!` doc header. Browse `src/cmds/*/` to discover available filters.
+
+Supported ecosystems: git/gh/glab/gt, cargo, go/golangci-lint, npm/pnpm/npx, ruff/pytest/pip/mypy, rspec/rubocop/rake, dotnet, gradlew (Android/JVM), playwright/vitest/jest, docker/kubectl/aws, psql/curl/wget.
 
 ### Proxy Mode
 
@@ -97,6 +113,21 @@ rtk proxy curl https://api.example.com/data  # Any command works
 
 All proxy commands appear in `rtk gain --history` with 0% savings (input = output).
 
+### Development environment variables
+
+Useful when debugging filters or routing:
+
+| Var | Effect |
+|-----|--------|
+| `RTK_NO_TOML=1` | Skip the TOML filter lookup in the fallback path (isolate routing bugs) |
+| `RTK_TOML_DEBUG=1` | Print which TOML filter matched and why |
+| `RTK_DB_PATH=<file>` | Point token tracking at an alternate SQLite DB (use in tests) |
+| `RTK_DATA_DIR=<dir>` | Override the data dir (tee logs, db, trust, telemetry) |
+| `RTK_HOOK_AUDIT=1` | Record hook-rewrite metrics (view with `rtk hook-audit`) |
+| `RTK_DISABLED=1` | Disable rtk behavior where honored |
+
+Telemetry is opt-in and off by default; `RTK_TELEMETRY_DISABLED=1` hard-blocks it regardless of consent.
+
 ## Coding Rules
 
 Rust patterns, error handling, and anti-patterns are defined in `.claude/rules/rust-patterns.md` (auto-loaded into context). Key points:
@@ -108,7 +139,7 @@ Rust patterns, error handling, and anti-patterns are defined in `.claude/rules/r
 - **No async**: single-threaded by design (startup <10ms)
 - **Exit code propagation**: `std::process::exit(code)` on child failure
 
-Testing strategy and performance targets are defined in `.claude/rules/cli-testing.md` (auto-loaded). Key targets: <10ms startup, <5MB memory, 60-90% token savings.
+Testing strategy and performance targets are defined in `.claude/rules/cli-testing.md` (auto-loaded). Key targets: <10ms startup, <5MB memory, 60-90% token savings. In practice, tests are embedded `#[cfg(test)] mod tests` blocks validated against real fixtures in `tests/fixtures/`, run with plain `cargo test` (each module defines its own `count_tokens` helper). The `insta`/snapshot workflow that file describes is aspirational — there is currently no `insta` dependency, `tests/common/mod.rs`, or `.snap` files, so don't reach for `cargo insta`.
 
 For contribution workflow and design philosophy, see [CONTRIBUTING.md](CONTRIBUTING.md). For the step-by-step filter implementation checklist, see [src/cmds/README.md](src/cmds/README.md#adding-a-new-command-filter).
 
@@ -119,6 +150,8 @@ For contribution workflow and design philosophy, see [CONTRIBUTING.md](CONTRIBUT
 ```bash
 cargo fmt --all && cargo clippy --all-targets && cargo test --all
 ```
+
+> **The build denies warnings.** `Cargo.toml` sets `[lints.rust] warnings = "deny"` and `unsafe_code = "deny"`, so an unused import or dead-code path fails `cargo build`/`clippy` outright — zero-tolerance is compiler-enforced, not just a CI nicety. MSRV is Rust 1.91 (edition 2021). The release profile uses `panic = "abort"`, which is why `main()` carries the sole `#[allow(unsafe_code)]` block to reset the `SIGPIPE` handler (a broken-pipe panic would otherwise abort with a coredump on e.g. `rtk git log | head`).
 
 **Rules**:
 - Never commit code that hasn't passed all 3 checks
