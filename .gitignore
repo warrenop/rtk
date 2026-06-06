@@ -46,5 +46,8 @@ claudedocs
 .vitals/
 .worktrees/
 
-# icm 
+# icm
 .fastembed_cache/
+
+# CodeGraph index (local, regenerable via `codegraph init`)
+.codegraph/
